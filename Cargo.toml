@@ -1,0 +1,32 @@
+[package]
+name = "niri-wallpaper"
+version = "0.1.0"
+edition = "2021"
+description = "Dual-layer wallpaper daemon for niri: normal background + blurred overview backdrop in one process"
+license = "MIT"
+
+[dependencies]
+# Wayland + layer-shell scaffolding.
+smithay-client-toolkit = "0.20"
+wayland-client = "0.31"
+
+# Event loop.
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+
+# Image decode (jpg/png/webp — the formats 99% of wallpapers use).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+# Filesystem watching.
+inotify = "0.11"
+
+# Small utilities.
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
