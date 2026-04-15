@@ -17,8 +17,15 @@ calloop-wayland-source = "0.4"
 # Image decode (jpg/png/webp — the formats 99% of wallpapers use).
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
+# SIMD-accelerated resizing for the per-output cover-scale hot path.
+fast_image_resize = "5"
+
 # Filesystem watching.
 inotify = "0.11"
+
+# FFI: malloc_trim(0) on glibc to return freed heap pages to the OS after
+# large decode/resize cycles (reclaims ~20-50 MB sustained RSS).
+libc = "0.2"
 
 # Small utilities.
 anyhow = "1"

@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use image::{imageops, RgbaImage};
+use fast_image_resize::images::{Image, ImageRef};
+use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+use image::RgbaImage;
 
 use calloop::{generic::Generic, EventLoop, Interest, LoopHandle, Mode, PostAction};
 use calloop_wayland_source::WaylandSource;
@@ -157,39 +159,70 @@ fn dirs_config_home() -> Result<PathBuf> {
 // Rendering helpers
 // ---------------------------------------------------------------------------
 
-/// Cover-scale `src` to exactly `(dst_w, dst_h)`, center-cropping.
-fn cover_scale(src: &RgbaImage, dst_w: u32, dst_h: u32) -> RgbaImage {
+/// Cover-scale `src` to exactly `(dst_w, dst_h)`, center-cropping. Uses
+/// `fast_image_resize` which is SIMD-vectorized and 3-5× faster than
+/// `image::imageops::resize` for the filters we use here.
+///
+/// The source crop rectangle (same aspect ratio as the destination, centered)
+/// is passed to the resizer via `ResizeOptions::crop`, so the resize and the
+/// center-crop happen in a single pass — no separate `crop_imm` copy.
+fn cover_scale(src: &RgbaImage, dst_w: u32, dst_h: u32, alg: ResizeAlg) -> RgbaImage {
     if dst_w == 0 || dst_h == 0 {
         return RgbaImage::new(1, 1);
     }
     let (sw, sh) = (src.width().max(1), src.height().max(1));
-    let scale = (dst_w as f32 / sw as f32).max(dst_h as f32 / sh as f32);
-    let new_w = ((sw as f32) * scale).ceil() as u32;
-    let new_h = ((sh as f32) * scale).ceil() as u32;
-    let scaled = imageops::resize(src, new_w, new_h, imageops::FilterType::Triangle);
 
-    let x_off = (new_w.saturating_sub(dst_w)) / 2;
-    let y_off = (new_h.saturating_sub(dst_h)) / 2;
-    imageops::crop_imm(&scaled, x_off, y_off, dst_w, dst_h).to_image()
+    // Aspect-matched source rectangle → the resizer stretches it to dst exactly.
+    let aspect_dst = dst_w as f64 / dst_h as f64;
+    let aspect_src = sw as f64 / sh as f64;
+    let (crop_w, crop_h) = if aspect_src > aspect_dst {
+        (sh as f64 * aspect_dst, sh as f64)
+    } else {
+        (sw as f64, sw as f64 / aspect_dst)
+    };
+    let crop_x = (sw as f64 - crop_w) / 2.0;
+    let crop_y = (sh as f64 - crop_h) / 2.0;
+
+    let src_view = ImageRef::new(sw, sh, src.as_raw(), PixelType::U8x4)
+        .expect("source ImageRef");
+    let mut dst_img = Image::new(dst_w, dst_h, PixelType::U8x4);
+
+    // Opaque wallpapers don't need premultiplied-alpha math.
+    let opts = ResizeOptions::new()
+        .resize_alg(alg)
+        .crop(crop_x, crop_y, crop_w, crop_h)
+        .use_alpha(false);
+
+    let mut resizer = Resizer::new();
+    resizer
+        .resize(&src_view, &mut dst_img, &opts)
+        .expect("resize");
+
+    RgbaImage::from_raw(dst_w, dst_h, dst_img.into_vec()).expect("RgbaImage from raw")
 }
 
-/// Copy an `RgbaImage` into a preformatted ARGB8888 little-endian byte buffer.
-/// wl_shm's `Argb8888` is a u32 ARGB on LE → memory order B, G, R, A.
-fn rgba_to_argb8888_le(img: &RgbaImage, out: &mut [u8]) {
-    let pixels = img.as_raw(); // R,G,B,A...
-    debug_assert_eq!(out.len(), pixels.len());
-    for (i, chunk) in pixels.chunks_exact(4).enumerate() {
-        let r = chunk[0];
-        let g = chunk[1];
-        let b = chunk[2];
-        let a = chunk[3];
-        let base = i * 4;
-        out[base] = b;
-        out[base + 1] = g;
-        out[base + 2] = r;
-        out[base + 3] = a;
+/// The Backdrop surface is already heavily blurred, so any interpolation on
+/// upscale produces the same visual result — use the cheapest algorithm.
+fn alg_for(role: SurfaceRole) -> ResizeAlg {
+    match role {
+        SurfaceRole::Normal => ResizeAlg::Convolution(FilterType::Bilinear),
+        SurfaceRole::Backdrop => ResizeAlg::Nearest,
     }
 }
+
+/// Return freed heap pages to the OS. glibc's allocator keeps freed memory
+/// as an internal cache by default; after a big decode + resize cycle the
+/// cache can be 20-50 MB. `malloc_trim(0)` hands it back.
+#[cfg(target_env = "gnu")]
+fn trim_heap() {
+    // SAFETY: malloc_trim is thread-safe and callable at any time.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn trim_heap() {}
 
 // ---------------------------------------------------------------------------
 // Per-surface state
@@ -314,6 +347,9 @@ impl App {
 
         self.image = Some(img);
         self.blurred = Some(blurred);
+
+        // Reclaim the decode/blur heap cache back to the OS.
+        trim_heap();
         Ok(())
     }
 
@@ -379,11 +415,64 @@ impl App {
     }
 
     fn redraw_all(&mut self) {
-        for idx in 0..self.outputs.len() {
-            for role in ROLES {
-                self.redraw_slot(idx, role);
-            }
+        // Gather the jobs that actually need rendering, borrowing the source
+        // images immutably so `cover_scale` can run on worker threads.
+        let image = self.image.as_ref();
+        let blurred = self.blurred.as_ref();
+
+        let jobs: Vec<(usize, SurfaceRole, u32, u32, &RgbaImage)> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, out)| {
+                ROLES.iter().copied().filter_map(move |role| {
+                    let slot = match role {
+                        SurfaceRole::Normal => &out.normal,
+                        SurfaceRole::Backdrop => &out.backdrop,
+                    };
+                    let (w, h) = slot.size?;
+                    if w == 0 || h == 0 {
+                        return None;
+                    }
+                    let src = match role {
+                        SurfaceRole::Normal => image?,
+                        SurfaceRole::Backdrop => blurred?,
+                    };
+                    Some((idx, role, w, h, src))
+                })
+            })
+            .collect();
+
+        if jobs.is_empty() {
+            return;
         }
+
+        // Phase 1: cover_scale in parallel. Each slot's resize is independent
+        // and CPU-bound; on multi-output setups this is the dominant cost.
+        let t0 = std::time::Instant::now();
+        let scaled: Vec<(usize, SurfaceRole, u32, u32, RgbaImage)> =
+            std::thread::scope(|s| {
+                let handles: Vec<_> = jobs
+                    .iter()
+                    .map(|&(idx, role, w, h, src)| {
+                        s.spawn(move || (idx, role, w, h, cover_scale(src, w, h, alg_for(role))))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("cover_scale thread"))
+                    .collect()
+            });
+        log::debug!("parallel cover_scale of {} slot(s) in {:?}", jobs.len(), t0.elapsed());
+
+        // Phase 2: upload + commit sequentially. The Wayland buffer / SlotPool
+        // machinery lives on the main thread.
+        for (idx, role, w, h, img) in scaled {
+            self.upload_slot(idx, role, w, h, img);
+        }
+
+        // The 4× parallel resizes allocate ~dst_w*dst_h*4 each. Reclaim now.
+        trim_heap();
     }
 
     fn redraw_slot(&mut self, idx: usize, role: SurfaceRole) {
@@ -393,13 +482,18 @@ impl App {
         };
         let Some(src_image) = src_image else { return };
 
-        let slot = self.outputs[idx].slot_mut(role);
-        let Some((w, h)) = slot.size else { return };
-        if w == 0 || h == 0 {
-            return;
-        }
+        let (w, h) = match self.outputs[idx].slot_mut(role).size {
+            Some((w, h)) if w > 0 && h > 0 => (w, h),
+            _ => return,
+        };
 
-        let scaled = cover_scale(src_image, w, h);
+        let scaled = cover_scale(src_image, w, h, alg_for(role));
+        self.upload_slot(idx, role, w, h, scaled);
+        trim_heap();
+    }
+
+    fn upload_slot(&mut self, idx: usize, role: SurfaceRole, w: u32, h: u32, scaled: RgbaImage) {
+        let slot = self.outputs[idx].slot_mut(role);
 
         let stride = (w * 4) as i32;
         let pool_len_needed = (stride as usize) * (h as usize);
@@ -415,11 +509,14 @@ impl App {
         }
         let pool = slot.pool.as_mut().expect("pool created above");
 
+        // `Abgr8888` on LE = bytes [R, G, B, A] — the native layout of
+        // `image::RgbaImage`, so the pixel copy below is a straight memcpy
+        // instead of a per-pixel swizzle.
         let (buffer, canvas) = match pool.create_buffer(
             w as i32,
             h as i32,
             stride,
-            wl_shm::Format::Argb8888,
+            wl_shm::Format::Abgr8888,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -428,7 +525,7 @@ impl App {
             }
         };
 
-        rgba_to_argb8888_le(&scaled, canvas);
+        canvas.copy_from_slice(scaled.as_raw());
 
         let wl_surface = slot.layer.wl_surface();
         wl_surface.damage_buffer(0, 0, w as i32, h as i32);
