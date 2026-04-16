@@ -1,5 +1,7 @@
 # niri-wallpaper
 
+![Preview](preview.png)
+
 A lightweight, single-process wallpaper daemon for [niri](https://github.com/YaLTeR/niri).
 
 It manages two layer-shell surfaces per output:
