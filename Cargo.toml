@@ -27,6 +27,15 @@ inotify = "0.11"
 # large decode/resize cycles (reclaims ~20-50 MB sustained RSS).
 libc = "0.2"
 
+# Config file.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Wallpaper rotation.
+rand = "0.9"
+croner = "3"
+chrono = "0.4"
+
 # Small utilities.
 anyhow = "1"
 log = "0.4"

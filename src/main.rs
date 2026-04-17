@@ -11,16 +11,18 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use image::RgbaImage;
 
-use calloop::{generic::Generic, EventLoop, Interest, LoopHandle, Mode, PostAction};
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{generic::Generic, EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 use calloop_wayland_source::WaylandSource;
-use inotify::{Inotify, WatchMask};
+use inotify::{Inotify, WatchDescriptor, WatchMask};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -43,82 +45,141 @@ use wayland_client::{
     Connection, Proxy, QueueHandle,
 };
 
+mod animation;
 mod blur;
+mod config;
+mod ipc;
+mod wallpaper;
 
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
+/// IPC subcommand sent to a running daemon instance.
 #[derive(Debug)]
-struct Args {
-    /// Symlink (or regular file) to the wallpaper. Watched for changes.
-    path: PathBuf,
-    normal_namespace: String,
-    backdrop_namespace: String,
-    /// Downsample factor applied before blurring (higher = softer + faster).
-    blur_downsample: u32,
-    /// Box-blur radius in downsampled pixels.
-    blur_radius: u32,
-    /// Number of box-blur passes (3 ≈ Gaussian).
-    blur_iterations: u32,
+enum IpcCommand {
+    Next,
+    Set(PathBuf),
+    Current,
 }
 
-impl Args {
-    fn parse() -> Result<Self> {
-        let config_dir = dirs_config_home()?;
-        let default_path = config_dir.join("niri-wallpaper").join("current");
+/// Parsed CLI: either run as the daemon or send an IPC command to a running
+/// instance.
+#[derive(Debug)]
+enum CliMode {
+    Daemon {
+        /// CLI overrides applied on top of the TOML config.
+        overrides: CliOverrides,
+    },
+    Ipc(IpcCommand),
+    /// Pick a random wallpaper from the library, update the `current` symlink,
+    /// print the path, and exit. No Wayland or daemon needed.
+    Rotate,
+}
 
-        let mut out = Self {
-            path: default_path,
-            normal_namespace: "wallpaper-bg".to_string(),
-            backdrop_namespace: "wallpaper".to_string(),
-            blur_downsample: 8,
-            blur_radius: 6,
-            blur_iterations: 3,
-        };
+/// Optional per-field CLI overrides. `None` means "use config/default".
+#[derive(Debug, Default)]
+struct CliOverrides {
+    path: Option<PathBuf>,
+    normal_namespace: Option<String>,
+    backdrop_namespace: Option<String>,
+    blur_downsample: Option<u32>,
+    blur_radius: Option<u32>,
+    blur_iterations: Option<u32>,
+}
 
-        let argv: Vec<String> = std::env::args().collect();
-        let mut i = 1;
-        while i < argv.len() {
-            let arg = &argv[i];
-            let next = || {
-                argv.get(i + 1)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("missing value for {}", arg))
-            };
-            match arg.as_str() {
-                "-p" | "--path" => {
-                    out.path = PathBuf::from(next()?);
-                    i += 2;
+fn parse_cli() -> Result<CliMode> {
+    let argv: Vec<String> = std::env::args().collect();
+
+    // Check for IPC subcommands first.
+    if argv.len() >= 2 {
+        match argv[1].as_str() {
+            "rotate" => return Ok(CliMode::Rotate),
+            "msg" => {
+                let sub = argv
+                    .get(2)
+                    .ok_or_else(|| anyhow!("usage: niri-wallpaper msg <next|set|current>"))?;
+                match sub.as_str() {
+                    "next" => return Ok(CliMode::Ipc(IpcCommand::Next)),
+                    "current" => return Ok(CliMode::Ipc(IpcCommand::Current)),
+                    "set" => {
+                        let path = argv
+                            .get(3)
+                            .ok_or_else(|| anyhow!("usage: niri-wallpaper msg set <path>"))?;
+                        return Ok(CliMode::Ipc(IpcCommand::Set(PathBuf::from(path))));
+                    }
+                    other => return Err(anyhow!("unknown msg command: {}", other)),
                 }
-                "--normal-namespace" => {
-                    out.normal_namespace = next()?;
-                    i += 2;
-                }
-                "--backdrop-namespace" => {
-                    out.backdrop_namespace = next()?;
-                    i += 2;
-                }
-                "--blur-downsample" => {
-                    out.blur_downsample = next()?.parse().context("--blur-downsample u32")?;
-                    i += 2;
-                }
-                "--blur-radius" => {
-                    out.blur_radius = next()?.parse().context("--blur-radius u32")?;
-                    i += 2;
-                }
-                "--blur-iterations" => {
-                    out.blur_iterations = next()?.parse().context("--blur-iterations u32")?;
-                    i += 2;
-                }
-                "-h" | "--help" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => return Err(anyhow!("unknown argument: {}", other)),
             }
+            _ => {}
         }
-        Ok(out)
+    }
+
+    let mut overrides = CliOverrides::default();
+    let mut i = 1;
+    while i < argv.len() {
+        let arg = &argv[i];
+        let next = || {
+            argv.get(i + 1)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing value for {}", arg))
+        };
+        match arg.as_str() {
+            "-p" | "--path" => {
+                overrides.path = Some(PathBuf::from(next()?));
+                i += 2;
+            }
+            "--normal-namespace" => {
+                overrides.normal_namespace = Some(next()?);
+                i += 2;
+            }
+            "--backdrop-namespace" => {
+                overrides.backdrop_namespace = Some(next()?);
+                i += 2;
+            }
+            "--blur-downsample" => {
+                overrides.blur_downsample =
+                    Some(next()?.parse().context("--blur-downsample u32")?);
+                i += 2;
+            }
+            "--blur-radius" => {
+                overrides.blur_radius = Some(next()?.parse().context("--blur-radius u32")?);
+                i += 2;
+            }
+            "--blur-iterations" => {
+                overrides.blur_iterations =
+                    Some(next()?.parse().context("--blur-iterations u32")?);
+                i += 2;
+            }
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            other => return Err(anyhow!("unknown argument: {}", other)),
+        }
+    }
+    Ok(CliMode::Daemon { overrides })
+}
+
+/// Apply CLI overrides on top of a loaded config.
+fn apply_overrides(config: &mut config::Config, overrides: &CliOverrides) {
+    if let Some(ref p) = overrides.path {
+        config.path = Some(p.clone());
+    }
+    if let Some(ref ns) = overrides.normal_namespace {
+        config.namespaces.normal = ns.clone();
+    }
+    if let Some(ref ns) = overrides.backdrop_namespace {
+        config.namespaces.backdrop = ns.clone();
+    }
+    if let Some(v) = overrides.blur_downsample {
+        config.blur.downsample = v;
+    }
+    if let Some(v) = overrides.blur_radius {
+        config.blur.radius = v;
+    }
+    if let Some(v) = overrides.blur_iterations {
+        config.blur.iterations = v;
     }
 }
 
@@ -127,11 +188,16 @@ fn print_help() {
         "niri-wallpaper — dual-layer wallpaper daemon for niri
 
 USAGE:
-    niri-wallpaper [OPTIONS]
+    niri-wallpaper [OPTIONS]       Start the daemon
+    niri-wallpaper rotate            Pick a random wallpaper, update symlink, exit
+    niri-wallpaper msg next          Force rotation on a running daemon
+    niri-wallpaper msg set <PATH>    Set a specific wallpaper on a running daemon
+    niri-wallpaper msg current       Print the current wallpaper path
 
 OPTIONS:
     -p, --path <PATH>              Path to wallpaper (symlink OK). Watched for changes.
-                                   [default: ~/.config/niri-wallpaper/current]
+                                   Overrides config file. [default from config or
+                                   ~/.config/niri-wallpaper/current]
     --normal-namespace <NAME>      Layer-shell namespace for the normal surface.
                                    [default: wallpaper-bg]
     --backdrop-namespace <NAME>    Layer-shell namespace for the backdrop surface.
@@ -142,11 +208,15 @@ OPTIONS:
     --blur-radius <N>              Box-blur radius (in downsampled pixels). [default: 6]
     --blur-iterations <N>          Box-blur passes (3 ≈ Gaussian). [default: 3]
     -h, --help                     Print this help.
+
+CONFIGURATION:
+    Config file: ~/.config/niri-wallpaper/config.toml
+    See project documentation for all config options.
 "
     );
 }
 
-fn dirs_config_home() -> Result<PathBuf> {
+pub(crate) fn dirs_config_home() -> Result<PathBuf> {
     if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(x));
     }
@@ -269,8 +339,9 @@ struct App {
     compositor_state: CompositorState,
     layer_shell: LayerShell,
     shm: Shm,
+    qh: QueueHandle<Self>,
 
-    args: Args,
+    config: config::Config,
 
     /// Currently loaded image (full-res RGBA). Kept for re-renders on
     /// configure / hotplug; re-decoded from disk on each wallpaper change.
@@ -278,6 +349,29 @@ struct App {
     /// Blurred, downsampled version of `image`. Small (≈ 1 MB). Cover-scaled
     /// per output at draw time.
     blurred: Option<RgbaImage>,
+
+    /// Path of the currently displayed wallpaper (for excluding from random
+    /// selection and for the IPC `current` command).
+    current_wallpaper: Option<PathBuf>,
+
+    /// Active cross-fade animation (if any).
+    fade: Option<animation::FadeState>,
+
+    /// New full-res image waiting for fade to complete.
+    pending_image: Option<RgbaImage>,
+
+    /// Persistent wallpaper usage tracker for weighted random selection.
+    usage: wallpaper::UsageTracker,
+
+    /// Calloop handle for inserting/removing event sources (e.g., schedule timer).
+    loop_handle: Option<LoopHandle<'static, App>>,
+
+    /// Cron timer registration token (so we can cancel/re-register on config change).
+    schedule_token: Option<RegistrationToken>,
+
+    /// Set to `true` after we update the `current` symlink ourselves, to
+    /// suppress the inotify event that the symlink update generates.
+    suppress_next_wallpaper_event: bool,
 
     /// wl_surface id → OutputSurfaces index.
     surface_to_output: HashMap<u32, usize>,
@@ -288,7 +382,7 @@ impl App {
     fn new(
         globals: &wayland_client::globals::GlobalList,
         qh: &QueueHandle<Self>,
-        args: Args,
+        config: config::Config,
     ) -> Result<Self> {
         let registry_state = RegistryState::new(globals);
         let output_state = OutputState::new(globals, qh);
@@ -298,24 +392,35 @@ impl App {
             LayerShell::bind(globals, qh).context("zwlr_layer_shell_v1 not available")?;
         let shm = Shm::bind(globals, qh).context("wl_shm not available")?;
 
+        let usage = wallpaper::UsageTracker::load();
+
         Ok(Self {
             registry_state,
             output_state,
             compositor_state,
             layer_shell,
             shm,
-            args,
+            qh: qh.clone(),
+            config,
             image: None,
             blurred: None,
+            current_wallpaper: None,
+            fade: None,
+            pending_image: None,
+            usage,
+            loop_handle: None,
+            schedule_token: None,
+            suppress_next_wallpaper_event: false,
             surface_to_output: HashMap::new(),
             outputs: Vec::new(),
         })
     }
 
-    /// (Re)load the image from disk and regenerate the blurred preview.
-    fn reload_image(&mut self) -> Result<()> {
-        let canonical = std::fs::canonicalize(&self.args.path)
-            .with_context(|| format!("resolve {}", self.args.path.display()))?;
+    /// Decode an image from disk and generate its blurred preview.
+    /// Returns `(image, blurred, canonical_path)`.
+    fn decode_image(&self, path: &Path) -> Result<(RgbaImage, RgbaImage, PathBuf)> {
+        let canonical = std::fs::canonicalize(path)
+            .with_context(|| format!("resolve {}", path.display()))?;
         log::info!("loading wallpaper: {}", canonical.display());
 
         let t0 = std::time::Instant::now();
@@ -332,9 +437,9 @@ impl App {
         let t0 = std::time::Instant::now();
         let blurred = blur::blur(
             &img,
-            self.args.blur_downsample,
-            self.args.blur_radius,
-            self.args.blur_iterations,
+            self.config.blur.downsample,
+            self.config.blur.radius,
+            self.config.blur.iterations,
         );
         log::info!(
             "blurred {}x{} → {}x{} in {:?}",
@@ -345,17 +450,302 @@ impl App {
             t0.elapsed()
         );
 
-        self.image = Some(img);
-        self.blurred = Some(blurred);
+        Ok((img, blurred, canonical))
+    }
 
-        // Reclaim the decode/blur heap cache back to the OS.
+    /// Load a new wallpaper and either instant-swap or start a cross-fade.
+    /// If `path` is `None`, resolves the wallpaper path from the config.
+    fn change_wallpaper(&mut self, path: Option<&Path>, qh: &QueueHandle<Self>) -> Result<()> {
+        let resolve;
+        let path = match path {
+            Some(p) => p,
+            None => {
+                resolve = config::resolve_wallpaper_path(&self.config)?;
+                &resolve
+            }
+        };
+
+        let (new_img, new_blurred, canonical) = self.decode_image(path)?;
+
+        let duration_ms = self.config.animation.duration_ms;
+        let has_old_image = self.image.is_some();
+
+        if duration_ms == 0 || !has_old_image {
+            // Instant swap (no animation, or first image load).
+            self.image = Some(new_img);
+            self.blurred = Some(new_blurred);
+            self.current_wallpaper = Some(canonical.clone());
+            self.redraw_all();
+        } else {
+            // If a fade is already in progress, finalize it first.
+            if self.fade.is_some() {
+                self.finalize_fade();
+            }
+
+            // Pre-scale old and new normal images for each output.
+            let old_image = self.image.as_ref().unwrap();
+            let output_frames: Vec<Option<animation::OutputFadeFrames>> = self
+                .outputs
+                .iter()
+                .map(|out| {
+                    let (w, h) = out.normal.size?;
+                    if w == 0 || h == 0 {
+                        return None;
+                    }
+                    let old_normal = cover_scale(old_image, w, h, alg_for(SurfaceRole::Normal));
+                    let new_normal = cover_scale(&new_img, w, h, alg_for(SurfaceRole::Normal));
+                    Some(animation::OutputFadeFrames {
+                        old_normal,
+                        new_normal,
+                    })
+                })
+                .collect();
+
+            // Instant-swap all backdrop surfaces to the new blurred image.
+            self.blurred = Some(new_blurred);
+
+            // Collect backdrop jobs first (avoid borrow conflict with upload_slot).
+            let backdrop_jobs: Vec<(usize, u32, u32, RgbaImage)> = self
+                .outputs
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, out)| {
+                    let (w, h) = out.backdrop.size?;
+                    if w == 0 || h == 0 {
+                        return None;
+                    }
+                    let blurred = self.blurred.as_ref()?;
+                    let scaled = cover_scale(blurred, w, h, alg_for(SurfaceRole::Backdrop));
+                    Some((idx, w, h, scaled))
+                })
+                .collect();
+            for (idx, w, h, scaled) in backdrop_jobs {
+                self.upload_slot(idx, SurfaceRole::Backdrop, w, h, scaled);
+            }
+
+            let duration = Duration::from_millis(duration_ms);
+            self.fade = Some(animation::FadeState {
+                start: Instant::now(),
+                duration,
+                easing: self.config.animation.easing,
+                output_frames,
+            });
+
+            // Store the new image — it will replace self.image when fade completes.
+            // We keep a reference to it in the fade state via output_frames.
+            // Store canonicalized path now.
+            self.current_wallpaper = Some(canonical.clone());
+
+            // Render first frame (fully old image) and request frame callbacks.
+            self.render_fade_frame(qh);
+
+            // Store the new full-res image for finalization.
+            // We stash it temporarily — need a field for this.
+            self.pending_image = Some(new_img);
+        }
+
         trim_heap();
         Ok(())
     }
 
+    /// Render one frame of the cross-fade animation and request the next
+    /// frame callback on each animated surface.
+    fn render_fade_frame(&mut self, qh: &QueueHandle<Self>) {
+        let fade = match self.fade.as_ref() {
+            Some(f) => f,
+            None => return,
+        };
+
+        let alpha = fade.progress();
+        let is_done = fade.is_done();
+
+        // Collect blended frames first to avoid borrow conflicts.
+        let frames: Vec<(usize, RgbaImage)> = fade
+            .output_frames
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, frames_opt)| {
+                let f = frames_opt.as_ref()?;
+                let blended = if is_done {
+                    f.new_normal.clone()
+                } else {
+                    animation::blend(&f.old_normal, &f.new_normal, alpha)
+                };
+                Some((idx, blended))
+            })
+            .collect();
+
+        for (idx, blended) in frames {
+            let (w, h) = blended.dimensions();
+            self.upload_slot(idx, SurfaceRole::Normal, w, h, blended);
+
+            if !is_done {
+                // Request next frame callback.
+                let wl_surface = self.outputs[idx].normal.layer.wl_surface();
+                wl_surface.frame(qh, wl_surface.clone());
+                self.outputs[idx].normal.layer.commit();
+            }
+        }
+
+        if is_done {
+            self.finalize_fade();
+        }
+    }
+
+    /// Finalize the cross-fade: promote new images to current, drop fade state.
+    fn finalize_fade(&mut self) {
+        if let Some(new_img) = self.pending_image.take() {
+            self.image = Some(new_img);
+        }
+        self.fade = None;
+        trim_heap();
+        log::debug!("cross-fade completed");
+    }
+
+    /// Handle a config file change: re-parse, diff, and apply.
+    fn handle_config_reload(&mut self, cli_overrides: &CliOverrides) {
+        let mut new_cfg = match config::load_config() {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("config reload failed: {:#}", e);
+                return;
+            }
+        };
+        apply_overrides(&mut new_cfg, cli_overrides);
+
+        let old = &self.config;
+
+        if old.namespaces != new_cfg.namespaces {
+            log::warn!(
+                "namespace config changed — restart required for this to take effect"
+            );
+        }
+
+        let blur_changed = old.blur != new_cfg.blur;
+        let schedule_changed = old.schedule != new_cfg.schedule;
+
+        self.config = new_cfg;
+
+        if blur_changed {
+            log::info!("blur config changed, regenerating");
+            if let Some(ref img) = self.image {
+                let blurred = blur::blur(
+                    img,
+                    self.config.blur.downsample,
+                    self.config.blur.radius,
+                    self.config.blur.iterations,
+                );
+                self.blurred = Some(blurred);
+                self.redraw_all();
+                trim_heap();
+            }
+        }
+
+        if schedule_changed {
+            log::info!("schedule config changed");
+            if let Some(ref lh) = self.loop_handle {
+                if let Some(ref schedule) = self.config.schedule {
+                    setup_schedule_timer(lh, &mut self.schedule_token, schedule);
+                } else {
+                    // Schedule removed — cancel the timer.
+                    if let Some(token) = self.schedule_token.take() {
+                        lh.remove(token);
+                        log::info!("schedule timer removed");
+                    }
+                }
+            }
+        }
+
+        log::info!("config reloaded successfully");
+    }
+
+    /// Pick the next wallpaper from the library using weighted random selection,
+    /// load it, update the current symlink, and redraw all outputs.
+    fn rotate_wallpaper(&mut self) {
+        let library_dir = match config::resolve_library_path(&self.config) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("cannot resolve library path: {:#}", e);
+                return;
+            }
+        };
+
+        let candidates = wallpaper::scan_library(&library_dir);
+        if candidates.is_empty() {
+            log::warn!("no wallpapers found in {}", library_dir.display());
+            return;
+        }
+
+        let chosen = match self.usage.pick(&candidates, self.current_wallpaper.as_deref()) {
+            Some(p) => p,
+            None => {
+                log::warn!("could not pick a wallpaper");
+                return;
+            }
+        };
+
+        log::info!("rotating to wallpaper: {}", chosen.display());
+        let qh = self.qh.clone();
+        if let Err(e) = self.change_wallpaper(Some(&chosen), &qh) {
+            log::error!("failed to load wallpaper {}: {:#}", chosen.display(), e);
+        }
+        // Update the current symlink so other apps can discover the wallpaper.
+        self.update_symlink();
+    }
+
+    /// Update the `current` symlink and suppress the resulting inotify event.
+    fn update_symlink(&mut self) {
+        if let Some(ref cur) = self.current_wallpaper {
+            self.suppress_next_wallpaper_event = true;
+            if let Err(e) = wallpaper::update_current_symlink(cur) {
+                log::error!("update current symlink: {:#}", e);
+                self.suppress_next_wallpaper_event = false;
+            }
+        }
+    }
+
+    /// Handle an IPC request and write the response.
+    fn handle_ipc(&mut self, mut stream: std::os::unix::net::UnixStream) {
+        let request = match ipc::read_request(&stream) {
+            Ok(r) => r,
+            Err(e) => {
+                ipc::write_error(&mut stream, &format!("{:#}", e));
+                return;
+            }
+        };
+
+        match request {
+            ipc::IpcRequest::Next => {
+                self.rotate_wallpaper();
+                match &self.current_wallpaper {
+                    Some(p) => ipc::write_response(&mut stream, &format!("ok {}", p.display())),
+                    None => ipc::write_error(&mut stream, "no wallpaper selected"),
+                }
+            }
+            ipc::IpcRequest::Set(path) => {
+                let qh = self.qh.clone();
+                match self.change_wallpaper(Some(&path), &qh) {
+                    Ok(()) => {
+                        self.update_symlink();
+                        ipc::write_response(&mut stream, "ok");
+                    }
+                    Err(e) => ipc::write_error(&mut stream, &format!("{:#}", e)),
+                }
+            }
+            ipc::IpcRequest::Current => {
+                match &self.current_wallpaper {
+                    Some(p) => ipc::write_response(&mut stream, &p.to_string_lossy()),
+                    None => ipc::write_response(&mut stream, "none"),
+                }
+            }
+        }
+    }
+
     fn add_output(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        let normal_layer = self.create_layer(qh, &output, &self.args.normal_namespace);
-        let backdrop_layer = self.create_layer(qh, &output, &self.args.backdrop_namespace);
+        let normal_ns = self.config.namespaces.normal.clone();
+        let backdrop_ns = self.config.namespaces.backdrop.clone();
+        let normal_layer = self.create_layer(qh, &output, &normal_ns);
+        let backdrop_layer = self.create_layer(qh, &output, &backdrop_ns);
 
         let idx = self.outputs.len();
         self.surface_to_output
@@ -564,10 +954,13 @@ impl CompositorHandler for App {
     fn frame(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _surface: &WlSurface,
         _time: u32,
     ) {
+        if self.fade.is_some() {
+            self.render_fade_frame(qh);
+        }
     }
 
     fn surface_enter(
@@ -690,93 +1083,277 @@ delegate_registry!(App);
 // Inotify → calloop source
 // ---------------------------------------------------------------------------
 
-/// We watch the *parent directory* of the target path for `MOVED_TO | CREATE`
-/// events matching the target's basename. This works with `ln -sfn` (which uses
-/// rename(2)) and also with plain file replacements.
-fn setup_inotify(path: &Path) -> Result<(Inotify, PathBuf, std::ffi::OsString)> {
-    let parent = path
+/// Tracks inotify watch descriptors so the callback can distinguish which
+/// file triggered an event.
+struct InotifyWatches {
+    /// Watch descriptor for the wallpaper path's parent directory.
+    wallpaper_wd: WatchDescriptor,
+    wallpaper_name: std::ffi::OsString,
+    /// Watch descriptor for the config file's parent directory (if different
+    /// from the wallpaper parent, or same directory with a different name).
+    config_wd: Option<WatchDescriptor>,
+    config_name: std::ffi::OsString,
+}
+
+const WATCH_MASK: WatchMask = WatchMask::MOVED_TO
+    .union(WatchMask::CREATE)
+    .union(WatchMask::CLOSE_WRITE)
+    .union(WatchMask::ATTRIB);
+
+/// Set up inotify watches for both the wallpaper path and the config file.
+fn setup_inotify(
+    wallpaper_path: &Path,
+    config_path: &Path,
+) -> Result<(Inotify, InotifyWatches)> {
+    let inotify = Inotify::init().context("inotify init")?;
+
+    // Watch wallpaper parent directory.
+    let wp_parent = wallpaper_path
         .parent()
-        .ok_or_else(|| anyhow!("wallpaper path has no parent: {}", path.display()))?
-        .to_path_buf();
-    let name = path
+        .ok_or_else(|| anyhow!("wallpaper path has no parent: {}", wallpaper_path.display()))?;
+    let wp_name = wallpaper_path
         .file_name()
-        .ok_or_else(|| anyhow!("wallpaper path has no file name: {}", path.display()))?
+        .ok_or_else(|| anyhow!("wallpaper path has no file name: {}", wallpaper_path.display()))?
         .to_os_string();
 
-    std::fs::create_dir_all(&parent)
-        .with_context(|| format!("create {}", parent.display()))?;
+    std::fs::create_dir_all(wp_parent)
+        .with_context(|| format!("create {}", wp_parent.display()))?;
 
-    let inotify = Inotify::init().context("inotify init")?;
-    inotify
+    let wallpaper_wd = inotify
         .watches()
-        .add(
-            &parent,
-            WatchMask::MOVED_TO
-                | WatchMask::CREATE
-                | WatchMask::CLOSE_WRITE
-                | WatchMask::ATTRIB,
-        )
-        .with_context(|| format!("inotify watch {}", parent.display()))?;
+        .add(wp_parent, WATCH_MASK)
+        .with_context(|| format!("inotify watch {}", wp_parent.display()))?;
 
-    Ok((inotify, parent, name))
+    // Watch config parent directory. If the config lives in the same directory
+    // as the wallpaper, inotify de-duplicates the watch (returns the same wd).
+    let cfg_parent = config_path
+        .parent()
+        .ok_or_else(|| anyhow!("config path has no parent: {}", config_path.display()))?;
+    let cfg_name = config_path
+        .file_name()
+        .ok_or_else(|| anyhow!("config path has no file name: {}", config_path.display()))?
+        .to_os_string();
+
+    std::fs::create_dir_all(cfg_parent)
+        .with_context(|| format!("create {}", cfg_parent.display()))?;
+
+    let config_wd = inotify
+        .watches()
+        .add(cfg_parent, WATCH_MASK)
+        .with_context(|| format!("inotify watch {}", cfg_parent.display()))?;
+
+    // If config_wd == wallpaper_wd, it means they share a directory — we still
+    // differentiate by file name in the callback.
+    let config_wd = if config_wd == wallpaper_wd {
+        None // same watch, differentiate by name only
+    } else {
+        Some(config_wd)
+    };
+
+    Ok((
+        inotify,
+        InotifyWatches {
+            wallpaper_wd,
+            wallpaper_name: wp_name,
+            config_wd,
+            config_name: cfg_name,
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
+/// Compute the `Duration` from now until the next occurrence of the given cron
+/// expression. Returns `None` if the expression is invalid or no next time exists.
+fn next_cron_duration(schedule: &str) -> Option<Duration> {
+    let cron = croner::Cron::from_str(schedule)
+        .map_err(|e| log::error!("invalid cron expression {:?}: {}", schedule, e))
+        .ok()?;
+    let now = chrono::Local::now();
+    let next = cron
+        .find_next_occurrence(&now, false)
+        .map_err(|e| log::error!("cron next occurrence error: {}", e))
+        .ok()?;
+    let delta = next.signed_duration_since(now);
+    // Convert chrono::Duration to std::time::Duration.
+    delta.to_std().ok().or_else(|| {
+        // If negative (somehow in the past), fire immediately.
+        Some(Duration::from_millis(0))
+    })
+}
+
+/// Register (or re-register) the cron timer on the calloop event loop.
+fn setup_schedule_timer(
+    loop_handle: &LoopHandle<'static, App>,
+    app_schedule_token: &mut Option<RegistrationToken>,
+    schedule: &str,
+) {
+    // Remove existing timer if any.
+    if let Some(token) = app_schedule_token.take() {
+        loop_handle.remove(token);
+    }
+
+    let duration = match next_cron_duration(schedule) {
+        Some(d) => d,
+        None => {
+            log::warn!("could not compute next cron occurrence for {:?}", schedule);
+            return;
+        }
+    };
+
+    log::info!(
+        "next wallpaper rotation in {:.0?} (schedule: {})",
+        duration,
+        schedule,
+    );
+
+    let schedule_owned = schedule.to_string();
+    let timer = Timer::from_duration(duration);
+    match loop_handle.insert_source(timer, move |_deadline, _metadata, app: &mut App| {
+        app.rotate_wallpaper();
+        // Reschedule for the next occurrence.
+        match next_cron_duration(&schedule_owned) {
+            Some(d) => {
+                log::info!("next wallpaper rotation in {:.0?}", d);
+                TimeoutAction::ToDuration(d)
+            }
+            None => {
+                log::warn!("no further cron occurrence, stopping rotation");
+                TimeoutAction::Drop
+            }
+        }
+    }) {
+        Ok(token) => *app_schedule_token = Some(token),
+        Err(e) => log::error!("failed to insert schedule timer: {}", e),
+    }
+}
+
+/// Standalone rotate: pick a random wallpaper from the library, update the
+/// `current` symlink, print the chosen path, and exit. No Wayland needed.
+fn run_rotate() -> Result<()> {
+    let cfg = config::load_config()?;
+    let library_dir = config::resolve_library_path(&cfg)?;
+
+    let candidates = wallpaper::scan_library(&library_dir);
+    if candidates.is_empty() {
+        anyhow::bail!("no wallpapers found in {}", library_dir.display());
+    }
+
+    // Read the current symlink target to exclude it from selection.
+    let current_symlink = config::resolve_wallpaper_path(&cfg).ok();
+    let current_canonical = current_symlink
+        .as_ref()
+        .and_then(|p| std::fs::canonicalize(p).ok());
+
+    let mut usage = wallpaper::UsageTracker::load();
+    let chosen = usage
+        .pick(&candidates, current_canonical.as_deref())
+        .ok_or_else(|| anyhow!("could not pick a wallpaper"))?;
+
+    let canonical = std::fs::canonicalize(&chosen)
+        .unwrap_or_else(|_| chosen.clone());
+
+    wallpaper::update_current_symlink(&canonical)?;
+    println!("{}", canonical.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Default to info-level logs unless RUST_LOG says otherwise.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let args = Args::parse()?;
+    let cli = parse_cli()?;
+
+    // Dispatch non-daemon modes.
+    let overrides = match cli {
+        CliMode::Ipc(cmd) => {
+            return ipc::run_client(cmd);
+        }
+        CliMode::Rotate => {
+            return run_rotate();
+        }
+        CliMode::Daemon { overrides } => overrides,
+    };
+
+    // Load config from file and apply CLI overrides.
+    let mut cfg = config::load_config()?;
+    let cli_overrides = overrides;
+    apply_overrides(&mut cfg, &cli_overrides);
+
+    let wallpaper_path = config::resolve_wallpaper_path(&cfg)?;
+    let cfg_path = config::config_path()?;
     log::info!(
         "starting niri-wallpaper (path={}, normal_ns={}, backdrop_ns={})",
-        args.path.display(),
-        args.normal_namespace,
-        args.backdrop_namespace,
+        wallpaper_path.display(),
+        cfg.namespaces.normal,
+        cfg.namespaces.backdrop,
     );
 
     let conn = Connection::connect_to_env().context("connect to Wayland")?;
     let (globals, event_queue) = registry_queue_init(&conn).context("registry_queue_init")?;
     let qh = event_queue.handle();
 
-    // Set up inotify before moving `args` into `App`.
-    let (inotify, _parent, watch_name) = setup_inotify(&args.path)?;
+    // Set up inotify for both wallpaper path and config file watching.
+    let (inotify, watches) = setup_inotify(&wallpaper_path, &cfg_path)?;
 
-    let mut app = App::new(&globals, &qh, args)?;
+    let mut app = App::new(&globals, &qh, cfg)?;
 
-    // Try to load the image now. It's OK if the file doesn't exist yet — the
-    // inotify watcher will pick it up when the picker script creates it.
-    if let Err(e) = app.reload_image() {
-        log::warn!("initial image load failed: {:#}", e);
+    // Load the wallpaper from the configured path / symlink.
+    // Use `niri-wallpaper rotate` before starting the daemon to pick a fresh
+    // wallpaper (e.g., in the niri spawn-at-startup or a systemd service).
+    {
+        let qh_clone = qh.clone();
+        if let Err(e) = app.change_wallpaper(None, &qh_clone) {
+            log::warn!("initial image load failed: {:#}", e);
+        }
     }
 
     let mut event_loop: EventLoop<App> =
         EventLoop::try_new().context("calloop event loop")?;
     let loop_handle: LoopHandle<App> = event_loop.handle();
+    app.loop_handle = Some(loop_handle.clone());
 
     WaylandSource::new(conn.clone(), event_queue)
         .insert(loop_handle.clone())
         .map_err(|e| anyhow!("insert wayland source: {}", e.error))?;
-    let watch_name = std::sync::Arc::new(watch_name);
+
+    let watches = std::sync::Arc::new(watches);
     let inotify_src = Generic::new(inotify, Interest::READ, Mode::Level);
     loop_handle
         .insert_source(inotify_src, {
-            let watch_name = watch_name.clone();
+            let watches = watches.clone();
             move |_readiness, inotify, app: &mut App| {
                 // SAFETY: we only read events from the inotify instance and don't drop it.
                 let inotify = unsafe { inotify.get_mut() };
                 let mut buf = [0u8; 4096];
-                let mut matched = false;
+                let mut wallpaper_changed = false;
+                let mut config_changed = false;
                 loop {
                     match inotify.read_events(&mut buf) {
                         Ok(events) => {
                             let mut any = false;
                             for ev in events {
                                 any = true;
-                                if ev.name == Some(watch_name.as_os_str()) {
-                                    matched = true;
+                                let name = ev.name;
+                                // Check if this event matches the wallpaper file.
+                                let is_wp_dir = ev.wd == watches.wallpaper_wd
+                                    || watches.config_wd.is_none();
+                                if is_wp_dir
+                                    && name == Some(watches.wallpaper_name.as_os_str())
+                                {
+                                    wallpaper_changed = true;
+                                }
+                                // Check if this event matches the config file.
+                                let is_cfg_dir = watches
+                                    .config_wd
+                                    .as_ref()
+                                    .map_or(true, |cwd| ev.wd == *cwd);
+                                if is_cfg_dir
+                                    && name == Some(watches.config_name.as_os_str())
+                                {
+                                    config_changed = true;
                                 }
                             }
                             if !any {
@@ -790,13 +1367,40 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                if matched {
-                    log::info!("wallpaper file changed, reloading");
-                    // Small grace period: `ln -sfn` and editors may emit several events.
+
+                if config_changed {
+                    log::info!("config file changed, reloading");
                     std::thread::sleep(Duration::from_millis(50));
-                    match app.reload_image() {
-                        Ok(()) => app.redraw_all(),
-                        Err(e) => log::error!("reload failed: {:#}", e),
+                    app.handle_config_reload(&cli_overrides);
+                }
+
+                if wallpaper_changed {
+                    if app.suppress_next_wallpaper_event {
+                        // This event was triggered by our own symlink update.
+                        app.suppress_next_wallpaper_event = false;
+                        log::debug!("suppressing self-triggered wallpaper event");
+                    } else {
+                        log::info!("wallpaper file changed, reloading");
+                        // Small grace period: `ln -sfn` and editors may emit several events.
+                        std::thread::sleep(Duration::from_millis(50));
+
+                        // Avoid reloading the same wallpaper we already have
+                        // (can happen if the symlink target didn't actually change).
+                        let wp_path = config::resolve_wallpaper_path(&app.config).ok();
+                        let canonical = wp_path.as_ref().and_then(|p| std::fs::canonicalize(p).ok());
+                        let already_loaded = match (&canonical, &app.current_wallpaper) {
+                            (Some(a), Some(b)) => a == b,
+                            _ => false,
+                        };
+
+                        if already_loaded {
+                            log::debug!("wallpaper unchanged, skipping reload");
+                        } else {
+                            let qh = app.qh.clone();
+                            if let Err(e) = app.change_wallpaper(None, &qh) {
+                                log::error!("reload failed: {:#}", e);
+                            }
+                        }
                     }
                 }
                 Ok(PostAction::Continue)
@@ -804,9 +1408,40 @@ fn main() -> Result<()> {
         })
         .map_err(|e| anyhow!("insert inotify source: {}", e))?;
 
+    // Set up IPC socket listener.
+    let ipc_listener = ipc::create_listener()?;
+    let ipc_src = Generic::new(ipc_listener, Interest::READ, Mode::Level);
+    loop_handle
+        .insert_source(ipc_src, |_readiness, listener, app: &mut App| {
+            let listener = unsafe { listener.get_mut() };
+            // Accept all pending connections.
+            loop {
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        app.handle_ipc(stream);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        log::error!("IPC accept: {}", e);
+                        break;
+                    }
+                }
+            }
+            Ok(PostAction::Continue)
+        })
+        .map_err(|e| anyhow!("insert IPC source: {}", e))?;
+
+    // Set up cron schedule timer if configured.
+    if let Some(ref schedule) = app.config.schedule.clone() {
+        setup_schedule_timer(&loop_handle, &mut app.schedule_token, schedule);
+    }
+
     log::info!("event loop ready");
     event_loop
         .run(None, &mut app, |_| {})
         .context("event loop")?;
+
+    // Best-effort cleanup.
+    ipc::cleanup_socket();
     Ok(())
 }
