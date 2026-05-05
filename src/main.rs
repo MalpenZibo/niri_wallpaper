@@ -271,12 +271,13 @@ fn cover_scale(src: &RgbaImage, dst_w: u32, dst_h: u32, alg: ResizeAlg) -> RgbaI
     RgbaImage::from_raw(dst_w, dst_h, dst_img.into_vec()).expect("RgbaImage from raw")
 }
 
-/// The Backdrop surface is already heavily blurred, so any interpolation on
-/// upscale produces the same visual result — use the cheapest algorithm.
 fn alg_for(role: SurfaceRole) -> ResizeAlg {
     match role {
         SurfaceRole::Normal => ResizeAlg::Convolution(FilterType::Bilinear),
-        SurfaceRole::Backdrop => ResizeAlg::Nearest,
+        // Bilinear upscale smooths out the pixel boundaries of the downsampled
+        // blur — nearest-neighbor leaves visible blocks at high downsample
+        // factors. The cost is minor (runs once per wallpaper change).
+        SurfaceRole::Backdrop => ResizeAlg::Convolution(FilterType::Bilinear),
     }
 }
 
