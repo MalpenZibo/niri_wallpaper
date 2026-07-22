@@ -745,8 +745,8 @@ impl App {
     fn add_output(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         let normal_ns = self.config.namespaces.normal.clone();
         let backdrop_ns = self.config.namespaces.backdrop.clone();
-        let normal_layer = self.create_layer(qh, &output, &normal_ns);
-        let backdrop_layer = self.create_layer(qh, &output, &backdrop_ns);
+        let normal_layer = self.create_layer(qh, &output, &normal_ns, Layer::Bottom);
+        let backdrop_layer = self.create_layer(qh, &output, &backdrop_ns, Layer::Background);
 
         let idx = self.outputs.len();
         self.surface_to_output
@@ -766,12 +766,13 @@ impl App {
         qh: &QueueHandle<Self>,
         output: &wl_output::WlOutput,
         namespace: &str,
+        layerbo: Layer,
     ) -> LayerSurface {
         let surface = self.compositor_state.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
             qh,
             surface,
-            Layer::Background,
+            layerbo,
             Some(namespace.to_string()),
             Some(output),
         );
