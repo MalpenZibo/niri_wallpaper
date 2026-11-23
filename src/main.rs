@@ -537,21 +537,25 @@ impl App {
             // Store canonicalized path now.
             self.current_wallpaper = Some(canonical.clone());
 
-            // Render first frame (fully old image) and request frame callbacks.
-            self.render_fade_frame(qh);
-
-            // Store the new full-res image for finalization.
-            // We stash it temporarily — need a field for this.
+            // Store the new full-res image for finalization, before the first
+            // frame: a fade that is already over finalizes there.
             self.pending_image = Some(new_img);
+
+            // Render first frame (fully old image) and request frame callbacks.
+            self.render_fade_frame(qh, None);
         }
 
         trim_heap();
         Ok(())
     }
 
-    /// Render one frame of the cross-fade animation and request the next
-    /// frame callback on each animated surface.
-    fn render_fade_frame(&mut self, qh: &QueueHandle<Self>) {
+    /// Render one frame of the cross-fade animation on output `only` (every
+    /// output when `None`) and request its next frame callback. Each surface
+    /// is paced by its own callbacks: rendering every output from any
+    /// callback would draw each one as many times per frame as there are
+    /// outputs, and pile up buffers the compositor still holds. The last
+    /// frame is drawn on every output at once.
+    fn render_fade_frame(&mut self, qh: &QueueHandle<Self>, only: Option<usize>) {
         let fade = match self.fade.as_ref() {
             Some(f) => f,
             None => return,
@@ -565,6 +569,7 @@ impl App {
             .output_frames
             .iter()
             .enumerate()
+            .filter(|&(idx, _)| is_done || only.is_none_or(|only| only == idx))
             .filter_map(|(idx, frames_opt)| {
                 let f = frames_opt.as_ref()?;
                 let blended = if is_done {
@@ -577,15 +582,17 @@ impl App {
             .collect();
 
         for (idx, blended) in frames {
-            let (w, h) = blended.dimensions();
-            self.upload_slot(idx, SurfaceRole::Normal, w, h, blended);
-
+            // An output removed during the fade.
+            if idx >= self.outputs.len() {
+                continue;
+            }
             if !is_done {
-                // Request next frame callback.
+                // Request the next frame callback, committed with the buffer.
                 let wl_surface = self.outputs[idx].normal.layer.wl_surface();
                 wl_surface.frame(qh, wl_surface.clone());
-                self.outputs[idx].normal.layer.commit();
             }
+            let (w, h) = blended.dimensions();
+            self.upload_slot(idx, SurfaceRole::Normal, w, h, blended);
         }
 
         if is_done {
@@ -599,8 +606,32 @@ impl App {
             self.image = Some(new_img);
         }
         self.fade = None;
+        self.shrink_pools();
         trim_heap();
         log::debug!("cross-fade completed");
+    }
+
+    /// Drop a surface's shm pool once it holds more than a few buffers of its
+    /// size: it grows while the compositor holds buffers and never shrinks,
+    /// and past `i32::MAX` bytes the compositor refuses it and closes the
+    /// connection. The next upload makes a fresh one; buffers still held keep
+    /// the old memory alive until they are released.
+    fn shrink_pools(&mut self) {
+        const BUFFERS_KEPT: usize = 3;
+
+        for out in &mut self.outputs {
+            for role in ROLES {
+                let slot = out.slot_mut(role);
+                let (Some((w, h)), Some(pool)) = (slot.size, slot.pool.as_ref()) else {
+                    continue;
+                };
+                let len = pool.len();
+                if len > (w as usize) * (h as usize) * 4 * BUFFERS_KEPT {
+                    log::debug!("dropping a {role:?} pool of {len} bytes");
+                    slot.pool = None;
+                }
+            }
+        }
     }
 
     /// Handle a config file change: re-parse, diff, and apply.
@@ -956,11 +987,14 @@ impl CompositorHandler for App {
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         _time: u32,
     ) {
-        if self.fade.is_some() {
-            self.render_fade_frame(qh);
+        if self.fade.is_none() {
+            return;
+        }
+        if let Some(&idx) = self.surface_to_output.get(&surface.id().protocol_id()) {
+            self.render_fade_frame(qh, Some(idx));
         }
     }
 
